@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
 };
 
@@ -34,7 +34,6 @@ enum Commands {
     },
 }
 
-use geo_types::coord;
 use osmpbf::{Element, ElementReader};
 
 #[derive(Debug, Default)]
@@ -43,7 +42,7 @@ struct Loc {
     nano_lon: i64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default, Hash, Eq, PartialEq)]
 struct NodeId(i64);
 
 #[derive(Debug, Default)]
@@ -70,7 +69,7 @@ struct StatsParsing {
     num_nodes: usize,
 }
 impl StatsParsing {
-    fn merge(mut self, other: Self) -> Self {
+    fn merge(self, other: Self) -> Self {
         Self {
             num_highways: self.num_highways + other.num_highways,
             num_drivable: self.num_drivable + other.num_drivable,
@@ -128,11 +127,11 @@ fn read_osm_pbf(osm_pbf: &Path) -> Result<()> {
     let reader = ElementReader::from_path(osm_pbf)
         .with_context(|| format!("Failed loading {}", osm_pbf.display()))?;
 
-    let parsed = reader.par_map_reduce(
+    let parsed_ways = reader.par_map_reduce(
         |element| match element {
             Element::Way(way) => parse_way(&way),
-            Element::Node(node) => parse_node(node),
-            Element::DenseNode(node) => parse_node(node),
+            Element::Node(node) => PbfReaderResult::default(),
+            Element::DenseNode(node) => PbfReaderResult::default(),
             Element::Relation(_relation) => PbfReaderResult::default(),
         },
         || PbfReaderResult::default(),
@@ -140,11 +139,50 @@ fn read_osm_pbf(osm_pbf: &Path) -> Result<()> {
     )?;
 
     println!(
-        "Parsed {} in {}ms",
-        osm_pbf.display(),
+        "INFO: Finished first parsing in {}ms",
         start_time.elapsed().as_millis()
     );
-    println!("Stats: {:#?}", parsed.stats);
+    println!("Stats: {:#?}", parsed_ways.stats);
+    let start_time = std::time::Instant::now();
+    let used_nodes = parsed_ways
+        .ways
+        .into_iter()
+        .map(|way| way.nodes)
+        .flatten()
+        .collect::<HashSet<_>>();
+    println!(
+        "INFO: Collected active nodes in {}ms",
+        start_time.elapsed().as_millis()
+    );
+
+    let start_time = std::time::Instant::now();
+    let reader = ElementReader::from_path(osm_pbf)
+        .with_context(|| format!("Failed loading {}", osm_pbf.display()))?;
+
+    let parsed_nodes = reader.par_map_reduce(
+        |element| match element {
+            Element::Way(_) => PbfReaderResult::default(),
+            Element::Node(node) => parse_node(node, &used_nodes),
+            Element::DenseNode(node) => parse_node(node, &used_nodes),
+            Element::Relation(_relation) => PbfReaderResult::default(),
+        },
+        || PbfReaderResult::default(),
+        |a, b| a.merge(b),
+    )?;
+
+    println!(
+        "INFO: Finished second parsing in {}ms",
+        start_time.elapsed().as_millis()
+    );
+    println!(
+        "Total number of nodes: {}k",
+        parsed_nodes.stats.num_nodes / 1000
+    );
+    println!(
+        "Number of parsed nodes: {}k",
+        parsed_nodes.nodes.len() / 1000
+    );
+
     Ok(())
 }
 fn parse_way(way: &osmpbf::Way) -> PbfReaderResult {
@@ -270,16 +308,22 @@ fn parse_way(way: &osmpbf::Way) -> PbfReaderResult {
     }
 }
 
-fn parse_node<T: SimpleNode>(node: T) -> PbfReaderResult {
-    let nodes = vec![(
-        NodeId(node.id()),
-        Node {
-            loc: Loc {
-                nano_lat: node.nano_lat(),
-                nano_lon: node.nano_lon(),
+fn parse_node<T: SimpleNode>(node: T, nodes_of_interest: &HashSet<NodeId>) -> PbfReaderResult {
+    let node_id = NodeId(node.id());
+
+    let nodes = if nodes_of_interest.contains(&node_id) {
+        vec![(
+            node_id,
+            Node {
+                loc: Loc {
+                    nano_lat: node.nano_lat(),
+                    nano_lon: node.nano_lon(),
+                },
             },
-        },
-    )];
+        )]
+    } else {
+        Vec::with_capacity(0)
+    };
 
     PbfReaderResult {
         nodes,
@@ -296,6 +340,14 @@ fn parse_node<T: SimpleNode>(node: T) -> PbfReaderResult {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Parse { fname } => read_osm_pbf(&fname),
+        Commands::Parse { fname } => {
+            let start_time = std::time::Instant::now();
+            let result = read_osm_pbf(&fname);
+            println!(
+                "INFO: Finished all parsing in {}ms",
+                start_time.elapsed().as_millis()
+            );
+            result
+        }
     }
 }
