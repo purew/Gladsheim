@@ -130,128 +130,7 @@ fn read_osm_pbf(osm_pbf: &Path) -> Result<()> {
 
     let parsed = reader.par_map_reduce(
         |element| match element {
-            Element::Way(way) => {
-                let mut is_drivable = false;
-                let mut name = None;
-                let mut is_oneway = false;
-                for (key, value) in way.tags() {
-                    match key {
-                        // https://wiki.openstreetmap.org/wiki/Key:highway
-                        "highway" => match value {
-                            // Main tags
-                            "motorway" => {
-                                is_drivable = true;
-                            }
-                            "trunk" => {
-                                is_drivable = true;
-                            }
-                            "primary" => {
-                                is_drivable = true;
-                            }
-                            "secondary" => {
-                                is_drivable = true;
-                            }
-                            "tertiary" => {
-                                is_drivable = true;
-                            }
-                            "unclassified" => {
-                                is_drivable = true;
-                            }
-                            "residential" => {
-                                is_drivable = true;
-                            }
-                            // Link roads
-                            "motorway_link" => {
-                                is_drivable = true;
-                            }
-                            "trunk_link" => {
-                                is_drivable = true;
-                            }
-                            "primary_link" => {
-                                is_drivable = true;
-                            }
-                            "secondary_link" => {
-                                is_drivable = true;
-                            }
-                            "tertiary_link" => {
-                                is_drivable = true;
-                            }
-                            // Special road types
-                            "living_street" => {}
-                            "service" => {}
-                            "pedestrian" => {}
-                            "track" => {}
-                            "bus_guideway" => {}
-                            "escape" => {}
-                            "raceway" => {}
-                            "road" => {}
-                            "busway" => {}
-                            _ => {
-                                //println!("Unhandled highway value: {}", value);
-                            }
-                        },
-                        "name" => {
-                            name = Some(value.to_string());
-                        }
-                        "oneway" => match value {
-                            "yes" => is_oneway = true,
-                            "no" => {}
-                            _ => {
-                                println!("WARN: Unknown oneway value: {}", value)
-                            }
-                        },
-
-                        _ => {}
-                    }
-                }
-
-                let ways = if is_drivable {
-                    //let polyline = {
-                    //    let coords = way.node_locations().into_iter().map(|way_node| {
-                    //        println!("Lat {} lon {}", way_node.lat(), way_node.lon());
-                    //        coord! {x: way_node.lon(), y: way_node.lat()}
-                    //    });
-                    //    let line_string: geo_types::LineString<f64> = coords.collect();
-                    //    match polyline::encode_coordinates(line_string, 6) {
-                    //        Ok(polyline) => polyline,
-                    //        Err(err) => {
-                    //            println!("ERR: Failed creating polyline: {:?}", err);
-                    //            "".into()
-                    //        }
-                    //    }
-                    //};
-                    //if !polyline.is_empty() {
-                    //    println!("Polyline {}", polyline);
-                    //}
-
-                    let nodes = way
-                        .refs()
-                        .into_iter()
-                        .map(|node_id| NodeId(node_id))
-                        .collect::<Vec<_>>();
-                    vec![Way {
-                        id: WayId(way.id()),
-                        name,
-                        is_oneway,
-                        nodes,
-                        //polyline,
-                    }]
-                } else {
-                    Vec::with_capacity(0)
-                };
-
-                PbfReaderResult {
-                    stats: StatsParsing {
-                        num_highways: 1,
-                        num_drivable: if is_drivable { 1 } else { 0 },
-                        num_oneways: if is_oneway { 1 } else { 0 },
-                        num_nodes: 0,
-                    },
-
-                    ways,
-                    nodes: Vec::with_capacity(0),
-                }
-            }
+            Element::Way(way) => parse_way(&way),
             Element::Node(node) => parse_node(node),
             Element::DenseNode(node) => parse_node(node),
             Element::Relation(_relation) => PbfReaderResult::default(),
@@ -267,6 +146,128 @@ fn read_osm_pbf(osm_pbf: &Path) -> Result<()> {
     );
     println!("Stats: {:#?}", parsed.stats);
     Ok(())
+}
+fn parse_way(way: &osmpbf::Way) -> PbfReaderResult {
+    let mut is_drivable = false;
+    let mut name = None;
+    let mut is_oneway = false;
+    for (key, value) in way.tags() {
+        match key {
+            // https://wiki.openstreetmap.org/wiki/Key:highway
+            "highway" => match value {
+                // Main tags
+                "motorway" => {
+                    is_drivable = true;
+                }
+                "trunk" => {
+                    is_drivable = true;
+                }
+                "primary" => {
+                    is_drivable = true;
+                }
+                "secondary" => {
+                    is_drivable = true;
+                }
+                "tertiary" => {
+                    is_drivable = true;
+                }
+                "unclassified" => {
+                    is_drivable = true;
+                }
+                "residential" => {
+                    is_drivable = true;
+                }
+                // Link roads
+                "motorway_link" => {
+                    is_drivable = true;
+                }
+                "trunk_link" => {
+                    is_drivable = true;
+                }
+                "primary_link" => {
+                    is_drivable = true;
+                }
+                "secondary_link" => {
+                    is_drivable = true;
+                }
+                "tertiary_link" => {
+                    is_drivable = true;
+                }
+                // Special road types
+                "living_street" => {}
+                "service" => {}
+                "pedestrian" => {}
+                "track" => {}
+                "bus_guideway" => {}
+                "escape" => {}
+                "raceway" => {}
+                "road" => {}
+                "busway" => {}
+                _ => {
+                    //println!("Unhandled highway value: {}", value);
+                }
+            },
+            "name" => {
+                name = Some(value.to_string());
+            }
+            "oneway" => match value {
+                "yes" => is_oneway = true,
+                "no" => {}
+                _ => {
+                    //println!("WARN: Unknown oneway value: {}", value)
+                }
+            },
+
+            _ => {}
+        }
+    }
+
+    let ways = if is_drivable {
+        //let polyline = {
+        //    let coords = way.node_locations().into_iter().map(|way_node| {
+        //        println!("Lat {} lon {}", way_node.lat(), way_node.lon());
+        //        coord! {x: way_node.lon(), y: way_node.lat()}
+        //    });
+        //    let line_string: geo_types::LineString<f64> = coords.collect();
+        //    match polyline::encode_coordinates(line_string, 6) {
+        //        Ok(polyline) => polyline,
+        //        Err(err) => {
+        //            println!("ERR: Failed creating polyline: {:?}", err);
+        //            "".into()
+        //        }
+        //    }
+        //};
+        //if !polyline.is_empty() {
+        //    println!("Polyline {}", polyline);
+        //}
+
+        let nodes = way
+            .refs()
+            .into_iter()
+            .map(|node_id| NodeId(node_id))
+            .collect::<Vec<_>>();
+        vec![Way {
+            id: WayId(way.id()),
+            name,
+            is_oneway,
+            nodes,
+            //polyline,
+        }]
+    } else {
+        Vec::with_capacity(0)
+    };
+
+    PbfReaderResult {
+        stats: StatsParsing {
+            num_highways: 1,
+            num_drivable: if is_drivable { 1 } else { 0 },
+            num_oneways: if is_oneway { 1 } else { 0 },
+            num_nodes: 0,
+        },
+
+        ways,
+        nodes: Vec::with_capacity(0),
+    }
 }
 
 fn parse_node<T: SimpleNode>(node: T) -> PbfReaderResult {
