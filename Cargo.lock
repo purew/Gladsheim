@@ -256,6 +256,7 @@ dependencies = [
  "geo-types",
  "osmpbf",
  "polyline",
+ "rayon",
  "thiserror 2.0.12",
 ]
 

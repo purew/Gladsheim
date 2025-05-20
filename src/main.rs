@@ -5,6 +5,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use rayon::prelude::*;
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -38,8 +39,10 @@ use osmpbf::{Element, ElementReader};
 
 #[derive(Debug, Default)]
 struct Loc {
-    nano_lat: i64,
-    nano_lon: i64,
+    //nano_lat: i64,
+    //nano_lon: i64,
+    lat: f64,
+    lon: f64,
 }
 
 #[derive(Clone, Debug, Default, Hash, Eq, PartialEq)]
@@ -54,7 +57,7 @@ struct Way {
     name: Option<String>,
     is_oneway: bool,
     nodes: Vec<NodeId>,
-    //polyline: String,
+    polyline: String,
 }
 
 #[derive(Debug, Default)]
@@ -95,11 +98,19 @@ impl PbfReaderResult {
 }
 
 trait SimpleNode {
+    fn lat(&self) -> f64;
+    fn lon(&self) -> f64;
     fn nano_lat(&self) -> i64;
     fn nano_lon(&self) -> i64;
     fn id(&self) -> i64;
 }
 impl SimpleNode for osmpbf::dense::DenseNode<'_> {
+    fn lat(&self) -> f64 {
+        self.lat()
+    }
+    fn lon(&self) -> f64 {
+        self.lon()
+    }
     fn nano_lat(&self) -> i64 {
         self.nano_lat()
     }
@@ -111,11 +122,17 @@ impl SimpleNode for osmpbf::dense::DenseNode<'_> {
     }
 }
 impl SimpleNode for osmpbf::elements::Node<'_> {
+    fn lat(&self) -> f64 {
+        self.lat()
+    }
+    fn lon(&self) -> f64 {
+        self.lat()
+    }
     fn nano_lat(&self) -> i64 {
         self.nano_lat()
     }
     fn nano_lon(&self) -> i64 {
-        self.nano_lon()
+        self.nano_lat()
     }
     fn id(&self) -> i64 {
         self.id()
@@ -127,7 +144,7 @@ fn read_osm_pbf(osm_pbf: &Path) -> Result<()> {
     let reader = ElementReader::from_path(osm_pbf)
         .with_context(|| format!("Failed loading {}", osm_pbf.display()))?;
 
-    let parsed_ways = reader.par_map_reduce(
+    let mut parsed_ways = reader.par_map_reduce(
         |element| match element {
             Element::Way(way) => parse_way(&way),
             Element::Node(node) => PbfReaderResult::default(),
@@ -146,8 +163,8 @@ fn read_osm_pbf(osm_pbf: &Path) -> Result<()> {
     let start_time = std::time::Instant::now();
     let used_nodes = parsed_ways
         .ways
-        .into_iter()
-        .map(|way| way.nodes)
+        .iter()
+        .map(|way| way.nodes.clone())
         .flatten()
         .collect::<HashSet<_>>();
     println!(
@@ -169,7 +186,6 @@ fn read_osm_pbf(osm_pbf: &Path) -> Result<()> {
         || PbfReaderResult::default(),
         |a, b| a.merge(b),
     )?;
-
     println!(
         "INFO: Finished second parsing in {}ms",
         start_time.elapsed().as_millis()
@@ -183,8 +199,37 @@ fn read_osm_pbf(osm_pbf: &Path) -> Result<()> {
         parsed_nodes.nodes.len() / 1000
     );
 
+    // Next, populate the polylines of the ways
+    let node_table = parsed_nodes.nodes.into_iter().collect::<HashMap<_, _>>();
+    parsed_ways.ways.par_iter_mut().for_each(|mut way| {
+        let coords = way
+            .nodes
+            .iter()
+            .filter_map(|node_id| match node_table.get(&node_id) {
+                Some(node) => Some(geo_types::coord! {
+                    x: node.loc.lon,
+                    y: node.loc.lat,
+                }),
+                None => {
+                    println!("ERR: Could not find node");
+                    None
+                }
+            });
+        let line_string: geo_types::LineString<f64> = coords.collect();
+        match polyline::encode_coordinates(line_string, 6) {
+            Ok(polyline) => {
+                //println!("DEBUG: Polyline {}", polyline);
+                way.polyline = polyline;
+            }
+            Err(err) => {
+                println!("ERR: Failed creating polyline: {:?}", err);
+            }
+        }
+    });
+
     Ok(())
 }
+
 fn parse_way(way: &osmpbf::Way) -> PbfReaderResult {
     let mut is_drivable = false;
     let mut name = None;
@@ -289,7 +334,7 @@ fn parse_way(way: &osmpbf::Way) -> PbfReaderResult {
             name,
             is_oneway,
             nodes,
-            //polyline,
+            polyline: "".into(),
         }]
     } else {
         Vec::with_capacity(0)
@@ -316,8 +361,10 @@ fn parse_node<T: SimpleNode>(node: T, nodes_of_interest: &HashSet<NodeId>) -> Pb
             node_id,
             Node {
                 loc: Loc {
-                    nano_lat: node.nano_lat(),
-                    nano_lon: node.nano_lon(),
+                    lat: node.lat(),
+                    lon: node.lon(),
+                    //nano_lat: node.nano_lat(),
+                    //nano_lon: node.nano_lon(),
                 },
             },
         )]
