@@ -37,7 +37,7 @@ enum Commands {
 
 use osmpbf::{Element, ElementReader};
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default, bincode::Encode, bincode::Decode)]
 struct Loc {
     //nano_lat: i64,
     //nano_lon: i64,
@@ -45,13 +45,13 @@ struct Loc {
     lon: f64,
 }
 
-#[derive(Clone, Debug, Default, Hash, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Hash, Eq, PartialEq, bincode::Encode, bincode::Decode)]
 struct NodeId(i64);
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, bincode::Encode, bincode::Decode)]
 struct WayId(i64);
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, bincode::Encode, bincode::Decode)]
 struct Way {
     id: WayId,
     name: Option<String>,
@@ -60,7 +60,7 @@ struct Way {
     polyline: String,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default, bincode::Encode, bincode::Decode)]
 struct Node {
     loc: Loc,
 }
@@ -81,18 +81,28 @@ impl StatsParsing {
         }
     }
 }
+#[derive(Debug, Default, bincode::Encode, bincode::Decode)]
+struct Map {
+    ways: Vec<Way>,
+    nodes: Vec<(NodeId, Node)>,
+}
+impl Map {
+    fn merge(mut self, other: Self) -> Self {
+        self.ways.extend(other.ways);
+        self.nodes.extend(other.nodes);
+        self
+    }
+}
 
 #[derive(Debug, Default)]
 struct PbfReaderResult {
     stats: StatsParsing,
-    ways: Vec<Way>,
-    nodes: Vec<(NodeId, Node)>,
+    map: Map,
 }
 impl PbfReaderResult {
     fn merge(mut self, other: Self) -> Self {
-        self.ways.extend(other.ways);
-        self.nodes.extend(other.nodes);
         self.stats = self.stats.merge(other.stats);
+        self.map = self.map.merge(other.map);
         self
     }
 }
@@ -161,7 +171,8 @@ fn read_osm_pbf(osm_pbf: &Path) -> Result<()> {
     );
     println!("Stats: {:#?}", parsed_ways.stats);
     let start_time = std::time::Instant::now();
-    let used_nodes = parsed_ways
+    let active_nodes = parsed_ways
+        .map
         .ways
         .iter()
         .map(|way| way.nodes.clone())
@@ -179,8 +190,8 @@ fn read_osm_pbf(osm_pbf: &Path) -> Result<()> {
     let parsed_nodes = reader.par_map_reduce(
         |element| match element {
             Element::Way(_) => PbfReaderResult::default(),
-            Element::Node(node) => parse_node(node, &used_nodes),
-            Element::DenseNode(node) => parse_node(node, &used_nodes),
+            Element::Node(node) => parse_node(node, &active_nodes),
+            Element::DenseNode(node) => parse_node(node, &active_nodes),
             Element::Relation(_relation) => PbfReaderResult::default(),
         },
         || PbfReaderResult::default(),
@@ -196,12 +207,17 @@ fn read_osm_pbf(osm_pbf: &Path) -> Result<()> {
     );
     println!(
         "Number of parsed nodes: {}k",
-        parsed_nodes.nodes.len() / 1000
+        parsed_nodes.map.nodes.len() / 1000
     );
 
     // Next, populate the polylines of the ways
-    let node_table = parsed_nodes.nodes.into_iter().collect::<HashMap<_, _>>();
-    parsed_ways.ways.par_iter_mut().for_each(|mut way| {
+    let node_table = parsed_nodes
+        .map
+        .nodes
+        .iter()
+        .cloned()
+        .collect::<HashMap<_, _>>();
+    parsed_ways.map.ways.par_iter_mut().for_each(|way| {
         let coords = way
             .nodes
             .iter()
@@ -226,6 +242,31 @@ fn read_osm_pbf(osm_pbf: &Path) -> Result<()> {
             }
         }
     });
+
+    let combined_ways_and_nodes = Map {
+        ways: parsed_ways.map.ways,
+        nodes: parsed_nodes.map.nodes,
+    };
+
+    let fname = {
+        let mut fname = PathBuf::from("/tmp/");
+        fname.push(osm_pbf.file_name().context("Missing filename")?);
+        fname
+    };
+    println!("INFO: Writing to {}", fname.display());
+    let start_time = std::time::Instant::now();
+    let mut file = std::fs::File::create(&fname)
+        .with_context(|| format!("Failed opening file {}", fname.display()))?;
+    bincode::encode_into_std_write(
+        combined_ways_and_nodes,
+        &mut file,
+        bincode::config::standard(),
+    )
+    .with_context(|| format!("Failed writing to file {}", fname.display()))?;
+    println!(
+        "INFO: Finished writing to filen in {}ms",
+        start_time.elapsed().as_millis()
+    );
 
     Ok(())
 }
@@ -348,8 +389,10 @@ fn parse_way(way: &osmpbf::Way) -> PbfReaderResult {
             num_nodes: 0,
         },
 
-        ways,
-        nodes: Vec::with_capacity(0),
+        map: Map {
+            ways,
+            nodes: Vec::with_capacity(0),
+        },
     }
 }
 
@@ -373,14 +416,16 @@ fn parse_node<T: SimpleNode>(node: T, nodes_of_interest: &HashSet<NodeId>) -> Pb
     };
 
     PbfReaderResult {
-        nodes,
+        map: Map {
+            nodes,
+            ..Default::default()
+        },
         stats: StatsParsing {
             num_highways: 0,
             num_drivable: 0,
             num_oneways: 0,
             num_nodes: 1,
         },
-        ..Default::default()
     }
 }
 
