@@ -5,9 +5,9 @@ use std::{
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use rayon::prelude::*;
 
 mod osm_parser;
+mod utils;
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -20,9 +20,12 @@ struct Cli {
 enum Commands {
     /// Parsing the osm.pbf into basic routing tiles
     ParseOsmToBasicTiles {
-        /// Parses the osm.pbf
+        /// The osm-file to parse
         #[arg(long)]
         fname: PathBuf,
+        /// A directory to write output files to
+        #[arg(long)]
+        output_dir: PathBuf,
     },
     /// Builds hub-labels from the basic data built in `ParseOsmToBasicTiles`
     BuildHubLabels {
@@ -37,7 +40,7 @@ enum Commands {
     },
 }
 
-#[derive(Clone, Debug, Default, Hash, Eq, PartialEq, bincode::Encode, bincode::Decode)]
+#[derive(Clone, Copy, Debug, Default, Hash, Eq, PartialEq, bincode::Encode, bincode::Decode)]
 struct NodeId(i64);
 
 #[derive(Debug, Default, bincode::Encode, bincode::Decode)]
@@ -51,23 +54,30 @@ struct Way {
     nodes: Vec<NodeId>,
     polyline: String,
 }
+#[derive(Debug, Default, bincode::Encode, bincode::Decode)]
+struct Edge {
+    from: NodeId,
+    to: NodeId,
+    is_oneway: bool,
+    nodes: Vec<NodeId>,
+}
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::ParseOsmToBasicTiles { fname } => {
+        Commands::ParseOsmToBasicTiles { fname, output_dir } => {
             let start_time = std::time::Instant::now();
-            let fname_tiles = osm_parser::read_osm_pbf(&fname)?;
+            let fname_tiles = osm_parser::read_osm_pbf(&fname, &output_dir)?;
             println!(
                 "INFO: Finished all parsing in {}ms and produced routing tiles in {}",
                 start_time.elapsed().as_millis(),
-                fname_tiles.display()
+                &output_dir.display()
             );
             Ok(())
         }
         Commands::BuildHubLabels {
-            fname,
-            directions_endpoint,
+            fname: _,
+            directions_endpoint: _,
         } => Ok(()),
     }
 }

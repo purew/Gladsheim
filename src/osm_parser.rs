@@ -1,13 +1,16 @@
 use std::{
     collections::{HashMap, HashSet},
+    hash::{DefaultHasher, Hash, Hasher},
     path::{Path, PathBuf},
+    sync::Mutex,
 };
 
 use anyhow::{Context, Result};
+use bincode::Encode;
 use osmpbf::{Element, ElementReader};
 use rayon::prelude::*;
 
-use crate::{NodeId, Way, WayId};
+use crate::{utils, Edge, NodeId, Way, WayId};
 
 #[derive(Clone, Debug, Default, bincode::Encode, bincode::Decode)]
 struct Loc {
@@ -105,7 +108,70 @@ impl SimpleNode for osmpbf::elements::Node<'_> {
     }
 }
 
-pub(crate) fn read_osm_pbf(osm_pbf: &Path) -> Result<PathBuf> {
+#[derive(Clone, Debug, Hash, Eq, PartialEq)]
+struct Quadkey(String);
+#[derive(Debug, Default, Encode)]
+struct Tile {
+    edges: Vec<Edge>,
+}
+
+/// A structure for allowing a multithreaded producer to inject
+/// edges into quadkey buckets with minimal lock contention
+struct ParallelQuadkeyMap {
+    /// A pre-allocated hashmap where buckets are mutex protected hashmaps
+    /// So that we can distribute lock-contention over the buckets
+    buckets: HashMap<usize, Mutex<HashMap<Quadkey, Tile>>>,
+}
+
+impl ParallelQuadkeyMap {
+    const NUM_BUCKETS: usize = 100; // Picked out of thin air
+    fn new() -> Self {
+        let mut buckets = HashMap::new();
+        for bucket_idx in 0..Self::NUM_BUCKETS {
+            buckets.insert(bucket_idx, Mutex::new(HashMap::new()));
+        }
+        Self { buckets }
+    }
+    fn insert(&self, quadkey: Quadkey, edge: Edge) {
+        let bucket_idx: usize = {
+            let mut s = DefaultHasher::new();
+            quadkey.hash(&mut s);
+            s.finish() as usize % Self::NUM_BUCKETS
+        };
+        let bucket = self
+            .buckets
+            .get(&bucket_idx)
+            // If this lookup fails, program state is invalid, so unwrap is ok
+            .unwrap();
+
+        let mut table = bucket
+            .lock()
+            // Poisoned mutex implied segfault in other part of code, avoid handling this for now
+            .unwrap();
+        let tile = table.entry(quadkey).or_insert(Tile::default());
+        tile.edges.push(edge);
+    }
+
+    /// Collects into the final data
+    /// FIXME: Just implement the iterator trait, no need to build a Vec
+    fn collect(self) -> Vec<(Quadkey, Tile)> {
+        let mut vec = Vec::with_capacity(Self::NUM_BUCKETS * 1000);
+        for mutex_protected_bucket in self.buckets.into_values() {
+            let table = mutex_protected_bucket
+                .into_inner()
+                // Destructuring the mutex to get inner value. No point in handling poisoned mutex, better to just unwrap and exit program if
+                // this occurs
+                .unwrap();
+
+            for (quadkey, tile) in table.into_iter() {
+                vec.push((quadkey, tile));
+            }
+        }
+        vec
+    }
+}
+
+pub(crate) fn read_osm_pbf(osm_pbf: &Path, output_tile_dir: &Path) -> Result<()> {
     let start_time = std::time::Instant::now();
     let reader = ElementReader::from_path(osm_pbf)
         .with_context(|| format!("Failed loading {}", osm_pbf.display()))?;
@@ -113,8 +179,8 @@ pub(crate) fn read_osm_pbf(osm_pbf: &Path) -> Result<PathBuf> {
     let mut parsed_ways = reader.par_map_reduce(
         |element| match element {
             Element::Way(way) => parse_way(&way),
-            Element::Node(node) => PbfReaderResult::default(),
-            Element::DenseNode(node) => PbfReaderResult::default(),
+            Element::Node(_node) => PbfReaderResult::default(),
+            Element::DenseNode(_node) => PbfReaderResult::default(),
             Element::Relation(_relation) => PbfReaderResult::default(),
         },
         || PbfReaderResult::default(),
@@ -166,66 +232,170 @@ pub(crate) fn read_osm_pbf(osm_pbf: &Path) -> Result<PathBuf> {
         parsed_nodes.map.nodes.len() / 1000
     );
 
-    // Next, populate the polylines of the ways
-    let node_table = parsed_nodes
-        .map
-        .nodes
-        .iter()
-        .cloned()
-        .collect::<HashMap<_, _>>();
-    parsed_ways.map.ways.par_iter_mut().for_each(|way| {
-        let coords = way
+    let node_table = {
+        let start_time = std::time::Instant::now();
+        let table = parsed_nodes
+            .map
             .nodes
             .iter()
-            .filter_map(|node_id| match node_table.get(&node_id) {
-                Some(node) => Some(geo_types::coord! {
-                    x: node.loc.lon,
-                    y: node.loc.lat,
-                }),
-                None => {
-                    println!("ERR: Could not find node");
-                    None
+            .cloned()
+            .collect::<HashMap<_, _>>();
+        println!(
+            "INFO: Constructed node lookup table in {}ms",
+            start_time.elapsed().as_millis()
+        );
+        table
+    };
+
+    let tiles = {
+        // Next, time to detect intersections and split ways into edges
+        let start_time = std::time::Instant::now();
+        let mut intersection_nodes = HashSet::new();
+        {
+            let mut seen_nodes = HashSet::new();
+            for way in &parsed_ways.map.ways {
+                for node_id in &way.nodes {
+                    if seen_nodes.contains(&node_id) {
+                        intersection_nodes.insert(*node_id);
+                    } else {
+                        seen_nodes.insert(node_id);
+                    }
                 }
-            });
-        let line_string: geo_types::LineString<f64> = coords.collect();
-        match polyline::encode_coordinates(line_string, 6) {
-            Ok(polyline) => {
-                //println!("DEBUG: Polyline {}", polyline);
-                way.polyline = polyline;
             }
-            Err(err) => {
-                println!("ERR: Failed creating polyline: {:?}", err);
-            }
+            println!(
+                "INFO: Calculated intersections in {}ms",
+                start_time.elapsed().as_millis()
+            );
         }
-    });
 
-    let combined_ways_and_nodes = Map {
-        ways: parsed_ways.map.ways,
-        nodes: parsed_nodes.map.nodes,
+        {
+            // Now, use intersections to split ways into edges
+            // Multithreaded off-course
+            let start_time = std::time::Instant::now();
+            let collector = ParallelQuadkeyMap::new();
+            let edges = parsed_ways
+                .map
+                .ways
+                .par_iter_mut()
+                .flat_map(|way| {
+                    let mut initial_node_index_on_edge = 0;
+                    let mut new_edges = Vec::new();
+                    for (node_index, node_id) in way.nodes.iter().enumerate() {
+                        if node_index==0 {
+                            // Nothing to cut on first index
+                        } else {
+                            if intersection_nodes.contains(node_id) {
+                                // We've reached an intersection and need to create an edge consisting of the
+                                // nodes leading up to this node
+                                let from = way.nodes[initial_node_index_on_edge];
+                                let to = way.nodes[node_index];
+                                let nodes = way.nodes[initial_node_index_on_edge..node_index].to_vec();
+                                if nodes.is_empty() {
+                                    println!("WARN: Produced edge with empty nodes. initial_node {initial_node_index_on_edge}, node_idx {node_index} from {}", way.id.0);
+                                } else {
+                                    new_edges.push(crate::Edge {
+                                        from,
+                                        to,
+                                        nodes,
+                                        is_oneway: way.is_oneway,
+                                    });
+                                }
+                                initial_node_index_on_edge = node_index;
+                            }
+                        }
+                    }
+                    new_edges
+                })
+                // Next, while we still have a parallel iterator, lets also do the assignment into Z7
+                // tiles
+                .for_each(|edge| {
+                    let node_id = edge
+                        .nodes
+                        .first()
+                        // It's invalid to have an edge without nodes so unwrap is ok here
+                        .unwrap();
+                    let node = node_table
+                        .get(node_id)
+                        // Program is invalid if the table misses this node, so unwrap is ok
+                        .unwrap();
+                    match utils::lat_lon_to_quadkey(node.loc.lat, node.loc.lon, 7) {
+                        Ok(s) => {
+                            let quadkey = Quadkey(s);
+                            collector.insert(quadkey, edge);
+                        }
+                        Err(err) => {
+                            println!("ERROR: Could not create quadkey: {}", err);
+                        }
+                    }
+                });
+
+            let tiles = collector.collect();
+            let num_edges: usize = tiles.iter().map(|(_quadkey, tile)| tile.edges.len()).sum();
+
+            println!(
+                "INFO: Split {}k ways into {}k edges and produced {} tiles in {}ms",
+                parsed_ways.map.ways.len() / 1000,
+                num_edges / 1000,
+                tiles.len(),
+                start_time.elapsed().as_millis()
+            );
+            tiles
+        }
     };
+    //// Next, populate the polylines of the ways
+    //parsed_ways.map.ways.par_iter_mut().for_each(|way| {
+    //    let coords = way
+    //        .nodes
+    //        .iter()
+    //        .filter_map(|node_id| match node_table.get(&node_id) {
+    //            Some(node) => Some(geo_types::coord! {
+    //                x: node.loc.lon,
+    //                y: node.loc.lat,
+    //            }),
+    //            None => {
+    //                println!("ERR: Could not find node");
+    //                None
+    //            }
+    //        });
+    //    let line_string: geo_types::LineString<f64> = coords.collect();
+    //    match polyline::encode_coordinates(line_string, 6) {
+    //        Ok(polyline) => {
+    //            //println!("DEBUG: Polyline {}", polyline);
+    //            way.polyline = polyline;
+    //        }
+    //        Err(err) => {
+    //            println!("ERR: Failed creating polyline: {:?}", err);
+    //        }
+    //    }
+    //});
 
-    let fname = {
-        let mut fname = PathBuf::from("/tmp/");
-        fname.push(osm_pbf.file_name().context("Missing filename")?);
-        fname.set_extension("grt");
-        fname
-    };
-    //println!("INFO: Writing to {}", fname.display());
-    //let start_time = std::time::Instant::now();
-    //let mut file = std::fs::File::create(&fname)
-    //    .with_context(|| format!("Failed opening file {}", fname.display()))?;
-    //bincode::encode_into_std_write(
-    //    combined_ways_and_nodes,
-    //    &mut file,
-    //    bincode::config::standard(),
-    //)
-    //.with_context(|| format!("Failed writing to file {}", fname.display()))?;
-    //println!(
-    //    "INFO: Finished writing to filen in {}ms",
-    //    start_time.elapsed().as_millis()
-    //);
+    {
+        // Finally write tiles to disk
+        let start_time = std::time::Instant::now();
+        let _results = tiles
+            .par_iter()
+            .map(|(quadkey, tile)| -> Result<()> {
+                let fname = {
+                    let mut fname = output_tile_dir.to_owned();
+                    fname.push(&quadkey.0);
+                    fname.set_extension("grt");
+                    fname
+                };
+                //println!("INFO: Writing to {}", fname.display());
+                let mut file = std::fs::File::create(&fname)
+                    .with_context(|| format!("Failed opening file {}", fname.display()))?;
+                bincode::encode_into_std_write(tile, &mut file, bincode::config::standard())
+                    .with_context(|| format!("Failed writing to file {}", fname.display()))?;
+                Ok(())
+            })
+            .collect::<Vec<_>>();
 
-    Ok(fname)
+        println!(
+            "INFO: Finished writing to files in {}ms",
+            start_time.elapsed().as_millis()
+        );
+    }
+    Ok(())
 }
 
 pub(crate) fn parse_way(way: &osmpbf::Way) -> PbfReaderResult {
