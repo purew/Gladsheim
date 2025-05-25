@@ -1,16 +1,14 @@
 use std::{
     collections::{HashMap, HashSet},
-    hash::{DefaultHasher, Hash, Hasher},
     path::{Path, PathBuf},
-    sync::Mutex,
 };
 
 use anyhow::{Context, Result};
-use bincode::Encode;
 use osmpbf::{Element, ElementReader};
 use rayon::prelude::*;
 
-use crate::{utils, Edge, NodeId, Way, WayId};
+use crate::{Edge, NodeId, Way, WayId, utils};
+use utils::{ParallelQuadkeyMap, Quadkey};
 
 #[derive(Clone, Debug, Default, bincode::Encode, bincode::Decode)]
 struct Loc {
@@ -105,69 +103,6 @@ impl SimpleNode for osmpbf::elements::Node<'_> {
     }
     fn id(&self) -> i64 {
         self.id()
-    }
-}
-
-#[derive(Clone, Debug, Hash, Eq, PartialEq)]
-struct Quadkey(String);
-#[derive(Debug, Default, Encode)]
-struct Tile {
-    edges: Vec<Edge>,
-}
-
-/// A structure for allowing a multithreaded producer to inject
-/// edges into quadkey buckets with minimal lock contention
-struct ParallelQuadkeyMap {
-    /// A pre-allocated hashmap where buckets are mutex protected hashmaps
-    /// So that we can distribute lock-contention over the buckets
-    buckets: HashMap<usize, Mutex<HashMap<Quadkey, Tile>>>,
-}
-
-impl ParallelQuadkeyMap {
-    const NUM_BUCKETS: usize = 100; // Picked out of thin air
-    fn new() -> Self {
-        let mut buckets = HashMap::new();
-        for bucket_idx in 0..Self::NUM_BUCKETS {
-            buckets.insert(bucket_idx, Mutex::new(HashMap::new()));
-        }
-        Self { buckets }
-    }
-    fn insert(&self, quadkey: Quadkey, edge: Edge) {
-        let bucket_idx: usize = {
-            let mut s = DefaultHasher::new();
-            quadkey.hash(&mut s);
-            s.finish() as usize % Self::NUM_BUCKETS
-        };
-        let bucket = self
-            .buckets
-            .get(&bucket_idx)
-            // If this lookup fails, program state is invalid, so unwrap is ok
-            .unwrap();
-
-        let mut table = bucket
-            .lock()
-            // Poisoned mutex implied segfault in other part of code, avoid handling this for now
-            .unwrap();
-        let tile = table.entry(quadkey).or_insert(Tile::default());
-        tile.edges.push(edge);
-    }
-
-    /// Collects into the final data
-    /// FIXME: Just implement the iterator trait, no need to build a Vec
-    fn collect(self) -> Vec<(Quadkey, Tile)> {
-        let mut vec = Vec::with_capacity(Self::NUM_BUCKETS * 1000);
-        for mutex_protected_bucket in self.buckets.into_values() {
-            let table = mutex_protected_bucket
-                .into_inner()
-                // Destructuring the mutex to get inner value. No point in handling poisoned mutex, better to just unwrap and exit program if
-                // this occurs
-                .unwrap();
-
-            for (quadkey, tile) in table.into_iter() {
-                vec.push((quadkey, tile));
-            }
-        }
-        vec
     }
 }
 
@@ -272,7 +207,7 @@ pub(crate) fn read_osm_pbf(osm_pbf: &Path, output_tile_dir: &Path) -> Result<()>
             // Now, use intersections to split ways into edges
             // Multithreaded off-course
             let start_time = std::time::Instant::now();
-            let collector = ParallelQuadkeyMap::new();
+            let collector = utils::ParallelQuadkeyMap::new();
             let edges = parsed_ways
                 .map
                 .ways
@@ -342,32 +277,6 @@ pub(crate) fn read_osm_pbf(osm_pbf: &Path, output_tile_dir: &Path) -> Result<()>
             tiles
         }
     };
-    //// Next, populate the polylines of the ways
-    //parsed_ways.map.ways.par_iter_mut().for_each(|way| {
-    //    let coords = way
-    //        .nodes
-    //        .iter()
-    //        .filter_map(|node_id| match node_table.get(&node_id) {
-    //            Some(node) => Some(geo_types::coord! {
-    //                x: node.loc.lon,
-    //                y: node.loc.lat,
-    //            }),
-    //            None => {
-    //                println!("ERR: Could not find node");
-    //                None
-    //            }
-    //        });
-    //    let line_string: geo_types::LineString<f64> = coords.collect();
-    //    match polyline::encode_coordinates(line_string, 6) {
-    //        Ok(polyline) => {
-    //            //println!("DEBUG: Polyline {}", polyline);
-    //            way.polyline = polyline;
-    //        }
-    //        Err(err) => {
-    //            println!("ERR: Failed creating polyline: {:?}", err);
-    //        }
-    //    }
-    //});
 
     {
         // Finally write tiles to disk
