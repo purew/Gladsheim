@@ -1,14 +1,14 @@
 use std::{
     collections::{HashMap, HashSet},
-    path::{Path, PathBuf},
+    path::Path,
 };
 
 use anyhow::{Context, Result};
 use osmpbf::{Element, ElementReader};
 use rayon::prelude::*;
 
-use crate::{Edge, NodeId, Way, WayId, utils};
-use utils::{ParallelQuadkeyMap, Quadkey};
+use crate::{utils, NodeId, Way, WayId};
+use utils::Quadkey;
 
 #[derive(Clone, Debug, Default, bincode::Encode, bincode::Decode)]
 struct Loc {
@@ -21,6 +21,8 @@ struct Loc {
 struct Node {
     loc: Loc,
 }
+
+/// Statistics from parsing the OSM data
 #[derive(Debug, Default)]
 struct StatsParsing {
     num_highways: usize,
@@ -51,6 +53,7 @@ impl Map {
     }
 }
 
+/// Results from parsing the OSM data
 #[derive(Debug, Default)]
 struct PbfReaderResult {
     stats: StatsParsing,
@@ -64,6 +67,7 @@ impl PbfReaderResult {
     }
 }
 
+/// A simple trait to abstract away the two OSM node implementations
 trait SimpleNode {
     fn lat(&self) -> f64;
     fn lon(&self) -> f64;
@@ -106,12 +110,16 @@ impl SimpleNode for osmpbf::elements::Node<'_> {
     }
 }
 
+/// Parses an OpenStreetMap dataset
+///
+/// Focus on being fast and highly multi-threaded
 pub(crate) fn read_osm_pbf(osm_pbf: &Path, output_tile_dir: &Path) -> Result<()> {
     let start_time = std::time::Instant::now();
     let reader = ElementReader::from_path(osm_pbf)
         .with_context(|| format!("Failed loading {}", osm_pbf.display()))?;
 
     let mut parsed_ways = reader.par_map_reduce(
+        // First, just read the Ways, and parse the drivable ones
         |element| match element {
             Element::Way(way) => parse_way(&way),
             Element::Node(_node) => PbfReaderResult::default(),
@@ -128,6 +136,7 @@ pub(crate) fn read_osm_pbf(osm_pbf: &Path, output_tile_dir: &Path) -> Result<()>
     );
     println!("Stats: {:#?}", parsed_ways.stats);
     let start_time = std::time::Instant::now();
+    // From these drivable Ways, we know which Nodes we actually need to store
     let active_nodes = parsed_ways
         .map
         .ways
@@ -144,6 +153,7 @@ pub(crate) fn read_osm_pbf(osm_pbf: &Path, output_tile_dir: &Path) -> Result<()>
     let reader = ElementReader::from_path(osm_pbf)
         .with_context(|| format!("Failed loading {}", osm_pbf.display()))?;
 
+    // Now we do the second parsing to parse the active nodes we just derived
     let parsed_nodes = reader.par_map_reduce(
         |element| match element {
             Element::Way(_) => PbfReaderResult::default(),
